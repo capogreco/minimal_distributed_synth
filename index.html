@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Synth - Minimal Distributed Synth</title>
+    <meta charset="utf-8">
+    <style>
+        body {
+            font-family: monospace;
+            padding: 20px;
+            max-width: 600px;
+            margin: 0 auto;
+            background: #1a1a1a;
+            color: #f0f0f0;
+        }
+        #status {
+            padding: 10px;
+            background: #333;
+            border-radius: 4px;
+            margin-bottom: 20px;
+        }
+        #visualizer {
+            width: 100%;
+            height: 200px;
+            background: #000;
+            border-radius: 4px;
+            margin: 20px 0;
+        }
+        .param {
+            padding: 10px;
+            margin: 10px 0;
+            background: #2a2a2a;
+            border-radius: 4px;
+        }
+        button {
+            padding: 10px 20px;
+            background: #444;
+            border: none;
+            color: white;
+            border-radius: 4px;
+            cursor: pointer;
+            font-family: monospace;
+        }
+        button:hover {
+            background: #555;
+        }
+    </style>
+</head>
+<body>
+    <h1>Synth</h1>
+    
+    <div id="status">Disconnected</div>
+    
+    <div id="controllers" style="margin-top: 20px;">
+        <h3>Connected Controllers</h3>
+        <div id="controller_list" style="padding: 10px; background: #2a2a2a; border-radius: 4px;">None</div>
+    </div>
+    
+    <button id="start_audio">Start Audio</button>
+    
+    <canvas id="visualizer"></canvas>
+    
+    <div id="params">
+        <div class="param">Volume: <span id="volume_display">0.5</span></div>
+    </div>
+
+    <script>
+        const synth_id = `synth-${Math.random ().toString (36).substr (2, 9)}`
+        let ws = null
+        let audio_context = null
+        let pink_noise = null
+        let gain_node = null
+        let analyser = null
+        const controllers = new Map ()
+        let stored_volume = 0.5  // store volume separately from gain
+        let is_powered_on = true  // track power state
+        
+        // webrtc configuration
+        let rtc_config = {
+            iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+        }
+        
+        // fetch ice servers from server
+        async function fetch_ice_servers () {
+            try {
+                const response = await fetch ("/ice-servers")
+                const data = await response.json ()
+                rtc_config.iceServers = data.ice_servers
+                console.log ("ICE servers loaded:", rtc_config.iceServers)
+            } catch (error) {
+                console.error ("Failed to fetch ICE servers, using defaults:", error)
+            }
+        }
+        
+        // ui elements
+        const status_el = document.getElementById ("status")
+        const start_button = document.getElementById ("start_audio")
+        const volume_display = document.getElementById ("volume_display")
+        const canvas = document.getElementById ("visualizer")
+        const ctx = canvas.getContext ("2d")
+        
+        // set canvas size
+        canvas.width = canvas.offsetWidth
+        canvas.height = canvas.offsetHeight
+        
+        // connect to websocket
+        function connect_websocket () {
+            const protocol = window.location.protocol === "https:" ? "wss:" : "ws:"
+            ws = new WebSocket (`${protocol}//${window.location.host}/ws`)
+            
+            ws.addEventListener ("open", () => {
+                console.log ("connected to server")
+                status_el.textContent = `Connected as ${synth_id}`
+                
+                // register with server
+                send_message ({
+                    type: "register",
+                    client_id: synth_id
+                })
+                
+                // announce presence to controllers
+                send_message ({
+                    type: "announce",
+                    source: synth_id,
+                    target: "ctrl-*"
+                })
+            })
+            
+            ws.addEventListener ("message", async (event) => {
+                const message = JSON.parse (event.data)
+                await handle_message (message)
+            })
+            
+            ws.addEventListener ("close", () => {
+                console.log ("disconnected from server")
+                status_el.textContent = "Disconnected - Reconnecting..."
+                setTimeout (connect_websocket, 2000)
+            })
+        }
+        
+        // send message via websocket
+        function send_message (message) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send (JSON.stringify (message))
+            }
+        }
+        
+        // handle incoming messages
+        async function handle_message (message) {
+            console.log ("received:", message)
+            
+            if (message.type === "announce" && message.source.startsWith ("ctrl-")) {
+                // controller announced itself, respond
+                send_message ({
+                    type: "announce",
+                    source: synth_id,
+                    target: message.source
+                })
+                update_controller_list ()
+                
+            } else if (message.type === "offer") {
+                // handle webrtc offer from controller
+                await handle_offer (message)
+                
+            } else if (message.type === "answer") {
+                // shouldn't receive answers as synth
+                console.warn ("synth received unexpected answer")
+                
+            } else if (message.type === "ice") {
+                // handle ice candidate
+                const controller = controllers.get (message.source)
+                if (controller && controller.connection) {
+                    try {
+                        if (controller.connection.remoteDescription) {
+                            console.log (`adding ice candidate: ${message.data.candidate}`)
+                            await controller.connection.addIceCandidate (message.data)
+                        } else {
+                            // queue ice candidate until remote description is set
+                            console.log ("queueing ice candidate")
+                            if (!controller.ice_queue) controller.ice_queue = []
+                            controller.ice_queue.push (message.data)
+                        }
+                    } catch (error) {
+                        console.error ("error adding ice candidate:", error)
+                    }
+                }
+            }
+        }
+        
+
+        
+        // initialize audio
+        async function init_audio () {
+            audio_context = new (window.AudioContext || window.webkitAudioContext) ()
+            
+            // load audio worklet
+            await audio_context.audioWorklet.addModule ("pink_noise.js")
+            
+            // create nodes
+            pink_noise = new AudioWorkletNode (audio_context, "ridge-rat-type2-pink-noise-generator")
+            gain_node = audio_context.createGain ()
+            analyser = audio_context.createAnalyser ()
+            
+            // connect nodes
+            pink_noise.connect (gain_node)
+            gain_node.connect (analyser)
+            analyser.connect (audio_context.destination)
+            
+            // set initial volume based on power state
+            gain_node.gain.value = is_powered_on ? stored_volume : 0
+            
+            // set pink noise amplitude
+            pink_noise.parameters.get ("amplitude").value = 0.5
+            
+            start_button.textContent = "Audio Running"
+            start_button.disabled = true
+            
+            // start visualizer
+            draw_visualizer ()
+        }
+        
+        // visualizer
+        function draw_visualizer () {
+            requestAnimationFrame (draw_visualizer)
+            
+            if (!analyser) return
+            
+            const buffer_length = analyser.frequencyBinCount
+            const data_array = new Uint8Array (buffer_length)
+            analyser.getByteFrequencyData (data_array)
+            
+            ctx.fillStyle = "rgb(0, 0, 0)"
+            ctx.fillRect (0, 0, canvas.width, canvas.height)
+            
+            const bar_width = (canvas.width / buffer_length) * 2.5
+            let bar_height
+            let x = 0
+            
+            for (let i = 0; i < buffer_length; i++) {
+                bar_height = (data_array[i] / 255) * canvas.height
+                
+                ctx.fillStyle = `rgb(${bar_height + 100}, 50, 50)`
+                ctx.fillRect (x, canvas.height - bar_height, bar_width, bar_height)
+                
+                x += bar_width + 1
+            }
+        }
+        
+        // handle webrtc offer
+        async function handle_offer (message) {
+            console.log (`handling offer from ${message.source}`)
+            
+            // create peer connection
+            const peer_connection = new RTCPeerConnection (rtc_config)
+            
+            // store controller info
+            const controller = {
+                connection: peer_connection,
+                param_channel: null,
+                command_channel: null,
+                ice_queue: []
+            }
+            controllers.set (message.source, controller)
+            
+            // handle ice candidates
+            peer_connection.addEventListener ("icecandidate", (event) => {
+                if (event.candidate) {
+                    console.log (`sending ice candidate: ${event.candidate.candidate}`)
+                    send_message ({
+                        type: "ice",
+                        source: synth_id,
+                        target: message.source,
+                        data: event.candidate
+                    })
+                } else {
+                    console.log ("ice gathering complete")
+                }
+            })
+            
+            // monitor ice connection state
+            peer_connection.addEventListener ("iceconnectionstatechange", () => {
+                console.log (`ice connection state: ${peer_connection.iceConnectionState}`)
+                update_controller_list ()
+            })
+            
+            // monitor ice gathering state  
+            peer_connection.addEventListener ("icegatheringstatechange", () => {
+                console.log (`ice gathering state: ${peer_connection.iceGatheringState}`)
+            })
+            
+            // clean up on connection failure
+            peer_connection.addEventListener ("connectionstatechange", () => {
+                if (peer_connection.connectionState === "failed" || peer_connection.connectionState === "closed") {
+                    controllers.delete (message.source)
+                    update_controller_list ()
+                }
+            })
+            
+            // handle data channels
+            peer_connection.addEventListener ("datachannel", (event) => {
+                const channel = event.channel
+                
+                if (channel.label === "params") {
+                    controller.param_channel = channel
+                    
+                    channel.addEventListener ("open", () => {
+                        console.log ("param channel open")
+                        status_el.textContent = `Connected as ${synth_id}`
+                        update_controller_list ()
+                    })
+                    
+                    channel.addEventListener ("message", (event) => {
+                        const data = JSON.parse (event.data)
+                        if (data.type === "param") {
+                            update_param (data.name, data.value, message.source)
+                        } else if (data.type === "ping") {
+                            // respond with pong
+                            channel.send (JSON.stringify ({
+                                type: "pong",
+                                timestamp: data.timestamp
+                            }))
+                        }
+                    })
+                    
+                    channel.addEventListener ("close", () => {
+                        console.log ("param channel closed")
+                        update_controller_list ()
+                    })
+                    
+                } else if (channel.label === "commands") {
+                    controller.command_channel = channel
+                    
+                    channel.addEventListener ("open", () => {
+                        console.log ("command channel open")
+                    })
+                    
+                    channel.addEventListener ("message", (event) => {
+                        const data = JSON.parse (event.data)
+                        if (data.type === "command") {
+                            handle_command (data.name, data.value, message.source)
+                        }
+                    })
+                }
+            })
+            
+            // set remote description and create answer
+            await peer_connection.setRemoteDescription (message.data)
+            const answer = await peer_connection.createAnswer ()
+            await peer_connection.setLocalDescription (answer)
+            
+            // process any queued ice candidates
+            if (controller.ice_queue && controller.ice_queue.length > 0) {
+                console.log (`processing ${controller.ice_queue.length} queued ice candidates`)
+                for (const candidate of controller.ice_queue) {
+                    try {
+                        await peer_connection.addIceCandidate (candidate)
+                    } catch (error) {
+                        console.error ("error adding queued ice candidate:", error)
+                    }
+                }
+                controller.ice_queue = []
+            }
+            
+            // send answer back
+            send_message ({
+                type: "answer",
+                source: synth_id,
+                target: message.source,
+                data: answer
+            })
+        }
+        
+        // handle parameter updates
+        function update_param (name, value, source) {
+            console.log (`param ${name} = ${value} from ${source}`)
+            if (name === "volume") {
+                stored_volume = value
+                volume_display.textContent = value.toFixed (2)
+                if (gain_node && is_powered_on) {
+                    gain_node.gain.value = value
+                }
+            }
+        }
+        
+        // handle command updates
+        function handle_command (name, value, source) {
+            console.log (`command ${name} = ${value} from ${source}`)
+            if (name === "power") {
+                is_powered_on = value
+                if (gain_node) {
+                    if (value) {
+                        // power on - restore stored volume
+                        gain_node.gain.value = stored_volume
+                    } else {
+                        // power off - mute
+                        gain_node.gain.value = 0
+                    }
+                }
+            }
+        }
+        
+        // update controller list ui
+        function update_controller_list () {
+            const controller_list_el = document.getElementById ("controller_list")
+            const connected_controllers = Array.from (controllers.entries ()).filter (
+                ([id, ctrl]) => ctrl.connection && ctrl.connection.iceConnectionState === "connected"
+            )
+            
+            if (connected_controllers.length === 0) {
+                controller_list_el.textContent = "None"
+            } else {
+                controller_list_el.innerHTML = connected_controllers.map (([id, ctrl]) => 
+                    `<div style="margin: 2px 0;">${id}</div>`
+                ).join ("")
+            }
+        }
+        
+        // start audio on user gesture
+        start_button.addEventListener ("click", init_audio)
+        
+        // start connection
+        fetch_ice_servers ().then (() => {
+            connect_websocket ()
+        })
+    </script>
+</body>
+</html>

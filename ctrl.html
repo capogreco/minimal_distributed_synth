@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Controller - Minimal Distributed Synth</title>
+    <meta charset="utf-8">
+    <style>
+        body {
+            font-family: monospace;
+            padding: 20px;
+            max-width: 600px;
+            margin: 0 auto;
+        }
+        .control {
+            margin: 20px 0;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+        }
+        input[type="range"] {
+            width: 100%;
+        }
+        #status {
+            padding: 10px;
+            background: #f0f0f0;
+            border-radius: 4px;
+            margin-bottom: 20px;
+        }
+        #synths {
+            margin-top: 20px;
+        }
+        .synth {
+            padding: 10px;
+            margin: 5px 0;
+            background: #e0e0e0;
+            border-radius: 4px;
+        }
+        .latency {
+            float: right;
+            font-size: 0.8em;
+            color: #666;
+        }
+        #stats {
+            padding: 10px;
+            background: #f5f5f5;
+            border-radius: 4px;
+            margin-bottom: 20px;
+            font-size: 0.9em;
+        }
+        .stat {
+            display: inline-block;
+            margin-right: 20px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Controller</h1>
+    
+    <div id="status">Disconnected</div>
+    
+    <div id="stats">
+        <span class="stat">Connected: <strong id="connected_count">0</strong></span>
+        <span class="stat">Avg Latency: <strong id="avg_latency">-</strong></span>
+    </div>
+    
+    <div id="controller_warning" style="display: none; padding: 10px; background: #ff9800; color: white; border-radius: 4px; margin-bottom: 10px;">
+        ⚠️ Multiple controllers detected - last change wins!
+        <div id="other_controllers" style="font-size: 0.9em; margin-top: 5px;"></div>
+    </div>
+    
+    <div class="control">
+        <label for="volume">Volume: <span id="volume_value">0.5</span></label>
+        <input type="range" id="volume" min="0" max="1" step="0.01" value="0.5">
+    </div>
+    
+    <div class="control">
+        <label>
+            <input type="checkbox" id="power" checked> Power On/Off
+        </label>
+    </div>
+    
+    <div id="synths">
+        <h3>Available Synths</h3>
+        <div id="synth_list">None connected</div>
+    </div>
+
+    <script>
+        const controller_id = `ctrl-${Math.random ().toString (36).substr (2, 9)}`
+        const peers = new Map ()
+        const other_controllers = new Set ()
+        let ws = null
+        
+        // webrtc configuration
+        let rtc_config = {
+            iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+        }
+        
+        // fetch ice servers from server
+        async function fetch_ice_servers () {
+            try {
+                const response = await fetch ("/ice-servers")
+                const data = await response.json ()
+                rtc_config.iceServers = data.ice_servers
+                console.log ("ICE servers loaded:", rtc_config.iceServers)
+            } catch (error) {
+                console.error ("Failed to fetch ICE servers, using defaults:", error)
+            }
+        }
+        
+        // ui elements
+        const status_el = document.getElementById ("status")
+        const volume_el = document.getElementById ("volume")
+        const volume_value_el = document.getElementById ("volume_value")
+        const synth_list_el = document.getElementById ("synth_list")
+        
+        // connect to websocket
+        function connect_websocket () {
+            const protocol = window.location.protocol === "https:" ? "wss:" : "ws:"
+            ws = new WebSocket (`${protocol}//${window.location.host}/ws`)
+            
+            ws.addEventListener ("open", () => {
+                console.log ("connected to server")
+                status_el.textContent = `Connected as ${controller_id}`
+                
+                // register with server
+                send_message ({
+                    type: "register",
+                    client_id: controller_id
+                })
+                
+                // announce presence to synths and other controllers
+                send_message ({
+                    type: "announce",
+                    source: controller_id,
+                    target: "synth-*"
+                })
+                send_message ({
+                    type: "announce", 
+                    source: controller_id,
+                    target: "ctrl-*"
+                })
+            })
+            
+            ws.addEventListener ("message", async (event) => {
+                const message = JSON.parse (event.data)
+                await handle_message (message)
+            })
+            
+            ws.addEventListener ("close", () => {
+                console.log ("disconnected from server")
+                status_el.textContent = "Disconnected - Reconnecting..."
+                setTimeout (connect_websocket, 2000)
+            })
+        }
+        
+        // send message via websocket
+        function send_message (message) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send (JSON.stringify (message))
+            }
+        }
+        
+        // handle incoming messages
+        async function handle_message (message) {
+            console.log ("received:", message)
+            
+            if (message.type === "announce" && message.source.startsWith ("synth-")) {
+                // synth announced itself
+                const existing_peer = peers.get (message.source)
+                update_synth_list (message.source, "discovered")
+                // automatically connect to newly discovered synth
+                if (!existing_peer || !existing_peer.connection) {
+                    await connect_to_synth (message.source)
+                }
+                
+            } else if (message.type === "announce" && message.source.startsWith ("ctrl-") && message.source !== controller_id) {
+                // another controller announced itself
+                const is_new = !other_controllers.has (message.source)
+                other_controllers.add (message.source)
+                update_controller_warning ()
+                // announce back only if this is a new controller
+                if (is_new) {
+                    send_message ({
+                        type: "announce",
+                        source: controller_id,
+                        target: message.source
+                    })
+                }
+                
+            } else if (message.type === "offer") {
+                // shouldn't receive offers as controller
+                console.warn ("controller received unexpected offer")
+                
+            } else if (message.type === "answer") {
+                // handle webrtc answer from synth
+                const peer = peers.get (message.source)
+                if (peer && peer.connection) {
+                    await peer.connection.setRemoteDescription (message.data)
+                    
+                    // process any queued ice candidates
+                    if (peer.ice_queue.length > 0) {
+                        console.log (`processing ${peer.ice_queue.length} queued ice candidates`)
+                        for (const candidate of peer.ice_queue) {
+                            await peer.connection.addIceCandidate (candidate)
+                        }
+                        peer.ice_queue = []
+                    }
+                }
+                
+            } else if (message.type === "ice") {
+                // handle ice candidate
+                const peer = peers.get (message.source)
+                if (peer && peer.connection) {
+                    try {
+                        if (peer.connection.remoteDescription) {
+                            console.log (`adding ice candidate: ${message.data.candidate}`)
+                            await peer.connection.addIceCandidate (message.data)
+                        } else {
+                            // queue ice candidate until remote description is set
+                            console.log ("queueing ice candidate")
+                            peer.ice_queue.push (message.data)
+                        }
+                    } catch (error) {
+                        console.error ("error adding ice candidate:", error)
+                    }
+                }
+            }
+        }
+        
+        // create webrtc connection to synth
+        window.connect_to_synth = async function (synth_id) {
+            console.log (`connecting to ${synth_id}`)
+            
+            const pc = new RTCPeerConnection (rtc_config)
+            // create two channels - UDP-like for params, TCP-like for commands
+            const param_channel = pc.createDataChannel ("params", { 
+                ordered: false,
+                maxRetransmits: 0 
+            })
+            const command_channel = pc.createDataChannel ("commands", { 
+                ordered: true 
+            })
+            
+            // store peer info
+            peers.set (synth_id, {
+                connection: pc,
+                param_channel: param_channel,
+                command_channel: command_channel,
+                ice_queue: [],
+                latency: null,
+                ping_interval: null
+            })
+            
+            // handle ice candidates
+            pc.addEventListener ("icecandidate", (event) => {
+                if (event.candidate) {
+                    console.log (`sending ice candidate: ${event.candidate.candidate}`)
+                    send_message ({
+                        type: "ice",
+                        source: controller_id,
+                        target: synth_id,
+                        data: event.candidate
+                    })
+                } else {
+                    console.log ("ice gathering complete")
+                }
+            })
+            
+            // handle connection state
+            pc.addEventListener ("connectionstatechange", () => {
+                console.log (`connection state: ${pc.connectionState}`)
+                
+                if (pc.connectionState === "failed" || pc.connectionState === "closed") {
+                    // clean up disconnected peer
+                    const peer = peers.get (synth_id)
+                    if (peer && peer.ping_interval) {
+                        clearInterval (peer.ping_interval)
+                    }
+                    peers.delete (synth_id)
+                    
+                    // retry connection after a delay
+                    if (pc.connectionState === "failed") {
+                        console.log (`retrying connection to ${synth_id} in 3 seconds...`)
+                        setTimeout (() => {
+                            // check if synth is still announcing
+                            send_message ({
+                                type: "announce",
+                                source: controller_id,
+                                target: synth_id
+                            })
+                        }, 3000)
+                    }
+                }
+                
+                update_synth_list (synth_id, pc.connectionState)
+            })
+            
+            // monitor ice connection state
+            pc.addEventListener ("iceconnectionstatechange", () => {
+                console.log (`ice connection state: ${pc.iceConnectionState}`)
+            })
+            
+            // monitor ice gathering state
+            pc.addEventListener ("icegatheringstatechange", () => {
+                console.log (`ice gathering state: ${pc.iceGatheringState}`)
+            })
+            
+            // handle param channel (UDP-like)
+            param_channel.addEventListener ("open", () => {
+                console.log (`param channel open to ${synth_id}`)
+                // send current volume
+                const value = parseFloat (volume_el.value)
+                param_channel.send (JSON.stringify ({
+                    type: "param",
+                    name: "volume",
+                    value: value
+                }))
+                
+                // start latency monitoring
+                const peer = peers.get (synth_id)
+                peer.ping_interval = setInterval (() => {
+                    if (param_channel.readyState === "open") {
+                        param_channel.send (JSON.stringify ({
+                            type: "ping",
+                            timestamp: Date.now ()
+                        }))
+                    }
+                }, 1000)
+            })
+            
+            // handle param channel messages
+            param_channel.addEventListener ("message", (event) => {
+                const data = JSON.parse (event.data)
+                if (data.type === "pong") {
+                    const rtt = Date.now () - data.timestamp
+                    const peer = peers.get (synth_id)
+                    peer.latency = rtt
+                    update_synth_list (synth_id, pc.connectionState)
+                }
+            })
+            
+            // handle param channel close
+            param_channel.addEventListener ("close", () => {
+                const peer = peers.get (synth_id)
+                if (peer.ping_interval) {
+                    clearInterval (peer.ping_interval)
+                }
+            })
+            
+            // handle command channel (TCP-like)
+            command_channel.addEventListener ("open", () => {
+                console.log (`command channel open to ${synth_id}`)
+                // send current power state
+                const is_on = power_el.checked
+                command_channel.send (JSON.stringify ({
+                    type: "command",
+                    name: "power",
+                    value: is_on
+                }))
+            })
+            
+            // create and send offer
+            const offer = await pc.createOffer ()
+            await pc.setLocalDescription (offer)
+            
+            send_message ({
+                type: "offer",
+                source: controller_id,
+                target: synth_id,
+                data: offer
+            })
+        }
+        
+        // update synth list ui
+        function update_synth_list (synth_id, status) {
+            if (status === "discovered" && !peers.has (synth_id)) {
+                peers.set (synth_id, { connection: null, channel: null })
+            }
+            
+            const synth_entries = Array.from (peers.entries ())
+            
+            if (synth_entries.length === 0) {
+                synth_list_el.innerHTML = "None connected"
+            } else {
+                synth_list_el.innerHTML = synth_entries.map (([id, peer]) => {
+                    const state = peer.connection ? peer.connection.connectionState : "discovered"
+                    const color = state === "connected" ? "#4a4" : 
+                                 state === "connecting" ? "#aa4" : "#888"
+                    const latency_text = peer.latency !== null ? `<span class="latency">${peer.latency}ms</span>` : ""
+                    return `<div class="synth" style="color: ${color};">${id} [${state}] ${latency_text}</div>`
+                }).join ("")
+            }
+            
+            // update stats
+            update_stats ()
+        }
+        
+        // update connection stats
+        function update_stats () {
+            const connected_peers = Array.from (peers.values ()).filter (
+                peer => peer.connection && peer.connection.connectionState === "connected"
+            )
+            
+            document.getElementById ("connected_count").textContent = connected_peers.length
+            
+            const latencies = connected_peers
+                .map (peer => peer.latency)
+                .filter (latency => latency !== null)
+            
+            if (latencies.length > 0) {
+                const avg = Math.round (latencies.reduce ((a, b) => a + b, 0) / latencies.length)
+                document.getElementById ("avg_latency").textContent = `${avg}ms`
+            } else {
+                document.getElementById ("avg_latency").textContent = "-"
+            }
+        }
+        
+        // volume control
+        volume_el.addEventListener ("input", (e) => {
+            const value = parseFloat (e.target.value)
+            volume_value_el.textContent = value.toFixed (2)
+            
+            // send to all connected peers via param channel (UDP-like)
+            peers.forEach ((peer, id) => {
+                if (peer.param_channel && peer.param_channel.readyState === "open") {
+                    peer.param_channel.send (JSON.stringify ({
+                        type: "param",
+                        name: "volume",
+                        value: value
+                    }))
+                }
+            })
+        })
+        
+        // power on/off control
+        const power_el = document.getElementById ("power")
+        power_el.addEventListener ("change", (e) => {
+            const is_on = e.target.checked
+            
+            // send to all connected peers via command channel (TCP-like)
+            peers.forEach ((peer, id) => {
+                if (peer.command_channel && peer.command_channel.readyState === "open") {
+                    peer.command_channel.send (JSON.stringify ({
+                        type: "command",
+                        name: "power",
+                        value: is_on
+                    }))
+                }
+            })
+        })
+        
+        // initialize UI to default values (override browser memory)
+        volume_el.value = 0.5
+        volume_value_el.textContent = "0.50"
+        power_el.checked = true
+        
+        // update controller warning display
+        function update_controller_warning () {
+            const warning_el = document.getElementById ("controller_warning")
+            const list_el = document.getElementById ("other_controllers")
+            
+            if (other_controllers.size > 0) {
+                warning_el.style.display = "block"
+                list_el.textContent = `Other controllers: ${Array.from (other_controllers).join (", ")}`
+            } else {
+                warning_el.style.display = "none"
+            }
+        }
+        
+        // start connection
+        fetch_ice_servers ().then (() => {
+            connect_websocket ()
+        })
+    </script>
+</body>
+</html>
