@@ -5,7 +5,7 @@ A WebRTC-based distributed audio synthesis template built for Deno Deploy's edge
 ## What This Template Provides
 
 - **WebRTC peer-to-peer connections** with automatic discovery and connection
-- **Dual data channels** - UDP-like for continuous parameters, TCP-like for discrete commands  
+- **Dual data channels** - UDP-like for continuous parameters, TCP-like for discrete commands
 - **TURN server integration** via Twilio for reliable connections through NATs
 - **State synchronization** - New synths receive current controller state on connect
 - **Pink noise synthesis** using AudioWorklet with Ridge-Rat Type 2 algorithm
@@ -81,6 +81,38 @@ deno task dev
 - Ridge-Rat Type 2 pink noise algorithm
 - Real-time parameter control
 
+### State Synchronization
+
+The template uses the ping/pong mechanism for state synchronization between controllers and synths:
+
+**How it works:**
+- Controllers send `ping` messages to synths every second
+- Synths respond with `pong` messages that include their complete state
+- No separate state notification messages needed
+
+**Synth state in pong response:**
+```javascript
+{
+  type: "pong",
+  timestamp: data.timestamp,
+  state: {
+    audio_enabled: !!audio_context,
+    volume: stored_volume,
+    powered_on: is_powered_on
+    // easily extensible with new state
+  }
+}
+```
+
+**Benefits:**
+- State automatically stays fresh (updates every second)
+- Single mechanism for all state synchronization
+- No timing issues or race conditions
+- Easy to extend - just add fields to the state object
+- Controllers always have current synth state without explicit requests
+
+This pattern keeps the codebase clean and makes state management predictable and debuggable.
+
 ## Extending the Template
 
 ### Adding New Audio Parameters
@@ -94,7 +126,7 @@ deno task dev
 ```javascript
 param_channel.send (JSON.stringify ({
     type: "param",
-    name: "frequency", 
+    name: "frequency",
     value: frequency
 }))
 ```
@@ -161,6 +193,7 @@ const synth = new AudioWorkletNode (audio_context, "my-synth")
 - **Automatic connections** - No manual connection steps required
 - **Last-write-wins** - Simple conflict resolution for multiple controllers
 - **Edge-first** - Built for distributed deployment from the start
+- **Ping/pong state sync** - State synchronization through existing latency mechanism
 
 ## Deployment
 

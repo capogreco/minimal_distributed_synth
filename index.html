@@ -24,6 +24,10 @@
             background: #000;
             border-radius: 4px;
             margin: 20px 0;
+            transition: opacity 0.3s;
+        }
+        #visualizer.dimmed {
+            opacity: 0.3;
         }
         .param {
             padding: 10px;
@@ -43,6 +47,36 @@
         button:hover {
             background: #555;
         }
+        #start_audio {
+            display: block;
+            margin: 30px auto;
+            padding: 15px 30px;
+            background: #c44;
+            font-size: 16px;
+            animation: pulse 2s infinite;
+        }
+        #start_audio:hover {
+            background: #d55;
+        }
+        #start_audio:disabled {
+            animation: none;
+            background: #444;
+            opacity: 0.5;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.8; }
+        }
+        #audio_hint {
+            text-align: center;
+            color: #888;
+            font-size: 14px;
+            margin-bottom: 10px;
+        }
+        .dimmed {
+            opacity: 0.3;
+            transition: opacity 0.3s;
+        }
     </style>
 </head>
 <body>
@@ -55,12 +89,13 @@
         <div id="controller_list" style="padding: 10px; background: #2a2a2a; border-radius: 4px;">None</div>
     </div>
     
+    <div id="audio_hint">Click to enable audio engine</div>
     <button id="start_audio">Start Audio</button>
     
-    <canvas id="visualizer"></canvas>
+    <canvas id="visualizer" class="dimmed"></canvas>
     
-    <div id="params">
-        <div class="param">Volume: <span id="volume_display">0.5</span></div>
+    <div id="params" class="dimmed">
+        <div class="param">Volume: <span id="volume_display">0.2</span></div>
     </div>
 
     <script>
@@ -71,7 +106,7 @@
         let gain_node = null
         let analyser = null
         const controllers = new Map ()
-        let stored_volume = 0.5  // store volume separately from gain
+        let stored_volume = 0.2  // store volume separately from gain
         let is_powered_on = true  // track power state
         
         // webrtc configuration
@@ -276,6 +311,17 @@
                 console.log (`param channel open to ${controller_id}`)
                 controller.connected = true
                 update_controller_list ()
+                
+                // send immediate state update (like a pong without a ping)
+                param_channel.send (JSON.stringify ({
+                    type: "pong",
+                    timestamp: Date.now (),
+                    state: {
+                        audio_enabled: !!audio_context,
+                        volume: stored_volume,
+                        powered_on: is_powered_on
+                    }
+                }))
             })
             
             param_channel.addEventListener ("message", (event) => {
@@ -340,10 +386,15 @@
             gain_node.gain.value = is_powered_on ? stored_volume : 0
             
             // set pink noise amplitude
-            pink_noise.parameters.get ("amplitude").value = 0.5
+            pink_noise.parameters.get ("amplitude").value = 0.2
             
             start_button.textContent = "Audio Running"
             start_button.disabled = true
+            document.getElementById ("audio_hint").style.display = "none"
+            
+            // remove dimmed state from UI elements
+            document.getElementById ("visualizer").classList.remove ("dimmed")
+            document.getElementById ("params").classList.remove ("dimmed")
             
             // start visualizer
             draw_visualizer ()
@@ -394,7 +445,12 @@
                     if (ctrl.channel && ctrl.channel.readyState === "open") {
                         ctrl.channel.send (JSON.stringify ({
                             type: "pong",
-                            timestamp: data.timestamp
+                            timestamp: data.timestamp,
+                            state: {
+                                audio_enabled: !!audio_context,
+                                volume: stored_volume,
+                                powered_on: is_powered_on
+                            }
                         }))
                         break
                     }

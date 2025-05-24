@@ -51,6 +51,10 @@
             display: inline-block;
             margin-right: 20px;
         }
+        .audio-off {
+            color: #f66;
+            font-weight: bold;
+        }
     </style>
 </head>
 <body>
@@ -69,8 +73,8 @@
     </div>
     
     <div class="control">
-        <label for="volume">Volume: <span id="volume_value">0.5</span></label>
-        <input type="range" id="volume" min="0" max="1" step="0.01" value="0.5">
+        <label for="volume">Volume: <span id="volume_value">0.2</span></label>
+        <input type="range" id="volume" min="0" max="1" step="0.01" value="0.2">
     </div>
     
     <div class="control">
@@ -263,7 +267,12 @@
                 command_channel: null,
                 ice_queue: [],
                 latency: null,
-                ping_interval: null
+                ping_interval: null,
+                state: {
+                    audio_enabled: false,
+                    volume: 0.2,
+                    powered_on: true
+                }
             }
             peers.set (message.source, peer)
             
@@ -316,6 +325,10 @@
                         if (data.type === "pong") {
                             const rtt = Date.now () - data.timestamp
                             peer.latency = rtt
+                            // update state if provided
+                            if (data.state) {
+                                peer.state = data.state
+                            }
                             update_synth_list (message.source, pc.connectionState)
                         }
                     })
@@ -531,7 +544,15 @@
         // update synth list ui
         function update_synth_list (synth_id, status) {
             if (status === "discovered" && !peers.has (synth_id)) {
-                peers.set (synth_id, { connection: null, channel: null })
+                peers.set (synth_id, { 
+                    connection: null, 
+                    channel: null,
+                    state: {
+                        audio_enabled: false,
+                        volume: 0.2,
+                        powered_on: true
+                    }
+                })
             }
             
             const synth_entries = Array.from (peers.entries ())
@@ -544,7 +565,8 @@
                     const color = state === "connected" ? "#4a4" : 
                                  state === "connecting" ? "#aa4" : "#888"
                     const latency_text = peer.latency !== null ? `<span class="latency">${peer.latency}ms</span>` : ""
-                    return `<div class="synth" style="color: ${color};">${id} [${state}] ${latency_text}</div>`
+                    const audio_indicator = (peer.state && peer.state.audio_enabled) ? "" : " <span class='audio-off'>[audio off]</span>"
+                    return `<div class="synth" style="color: ${color};">${id} [${state}]${audio_indicator} ${latency_text}</div>`
                 }).join ("")
             }
             
@@ -607,8 +629,8 @@
         })
         
         // initialize UI to default values (override browser memory)
-        volume_el.value = 0.5
-        volume_value_el.textContent = "0.50"
+        volume_el.value = 0.2
+        volume_value_el.textContent = "0.20"
         power_el.checked = true
         
         // update controller warning display

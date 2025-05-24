@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-A minimal, elegant WebRTC-based distributed audio synthesis system designed for edge deployment on Deno Deploy. This project enables a controller interface to manipulate audio parameters on multiple distributed synthesizer clients in real-time.
+A minimal WebRTC-based distributed audio synthesis system designed for edge deployment on Deno Deploy. This project enables a controller interface to manipulate audio parameters on multiple distributed synthesizer clients in real-time.
 
 ## Background & Motivation
 
@@ -120,7 +120,7 @@ But first, we prove the architecture with just volume control.
 After spending significant time fighting framework complexity, we realized:
 - WebRTC + edge deployment is challenging enough on its own
 - Every abstraction layer adds more places for things to go wrong
-- The simplest code is often the most elegant
+- The simplest code is often the best
 - You can always add complexity later
 
 ## Technical References
@@ -132,7 +132,7 @@ After spending significant time fighting framework complexity, we realized:
 
 ## Contributing
 
-This is a learning/experiment project. The goal is to keep it as simple as possible while solving the distributed synthesis challenge elegantly.
+This is a learning/experiment project. The goal is to keep it as simple as possible while solving the distributed synthesis challenge with clarity and simplicity.
 
 ---
 

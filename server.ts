@@ -1,14 +1,88 @@
 // minimal deno server with websocket signaling and kv message queuing
 
+// Type definitions
+// These interfaces provide compile-time type safety for all messages and data structures.
+// Using discriminated unions (type field) allows TypeScript to narrow message types automatically.
+interface ConnectionInfo {
+    socket: WebSocket;
+    actual_id: string | null;
+}
+
+interface KVControllerEntry {
+    timestamp: number;
+    ws_id: string;
+}
+
+interface BaseMessage {
+    type: string;
+    source?: string;
+    target?: string;
+    sender_id?: string;
+    timestamp?: number;
+}
+
+interface RegisterMessage extends BaseMessage {
+    type: "register";
+    client_id: string;
+}
+
+interface HeartbeatMessage extends BaseMessage {
+    type: "heartbeat";
+}
+
+interface RequestControllersMessage extends BaseMessage {
+    type: "request-controllers";
+}
+
+interface ControllersListMessage extends BaseMessage {
+    type: "controllers-list";
+    controllers: string[];
+}
+
+interface ControllerJoinedMessage extends BaseMessage {
+    type: "controller-joined";
+    controller_id: string;
+}
+
+interface ControllerLeftMessage extends BaseMessage {
+    type: "controller-left";
+    controller_id: string;
+}
+
+interface SignalingMessage extends BaseMessage {
+    type: "offer" | "answer" | "ice";
+    data: any;
+}
+
+type Message = RegisterMessage | HeartbeatMessage | RequestControllersMessage | 
+               ControllersListMessage | ControllerJoinedMessage | ControllerLeftMessage |
+               SignalingMessage | BaseMessage;
+
+interface SynthState {
+    audio_enabled: boolean;
+    volume: number;
+    powered_on: boolean;
+}
+
+interface IceServer {
+    urls: string | string[];
+    username?: string;
+    credential?: string;
+}
+
+interface IceServersResponse {
+    ice_servers: IceServer[];
+}
+
 const kv = await Deno.openKv ()
-const connections = new Map ()
+const connections = new Map<string, ConnectionInfo> ()
 
 // load env variables
 const TWILIO_ACCOUNT_SID = Deno.env.get ("TWILIO_ACCOUNT_SID")
 const TWILIO_AUTH_TOKEN = Deno.env.get ("TWILIO_AUTH_TOKEN")
 
 // get TURN credentials from Twilio
-async function get_turn_credentials () {
+async function get_turn_credentials (): Promise<IceServer[] | null> {
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
         return null
     }
@@ -40,7 +114,7 @@ async function get_turn_credentials () {
 }
 
 // serve static files and handle websocket upgrade
-async function handle_request (request) {
+async function handle_request (request: Request): Promise<Response> {
     const url = new URL (request.url)
     
     // websocket upgrade
@@ -51,7 +125,7 @@ async function handle_request (request) {
         
         socket.addEventListener ("open", () => {
             console.log (`client connected: ${temp_id}`)
-            connections.set (temp_id, { socket, actual_id: null })
+            connections.set (temp_id, { socket, actual_id: null } as ConnectionInfo)
         })
         
         socket.addEventListener ("message", async (event) => {
@@ -62,13 +136,13 @@ async function handle_request (request) {
                 const old_id = client_id
                 client_id = data.client_id
                 connections.delete (old_id)
-                connections.set (client_id, { socket, actual_id: client_id })
+                connections.set (client_id, { socket, actual_id: client_id } as ConnectionInfo)
                 console.log (`client registered as: ${client_id}`)
                 
                 // if this is a controller, add to KV registry
                 if (client_id.startsWith ("ctrl-")) {
                     const key = ["controllers", client_id]
-                    const value = {
+                    const value: KVControllerEntry = {
                         timestamp: Date.now (),
                         ws_id: temp_id
                     }
@@ -76,7 +150,7 @@ async function handle_request (request) {
                     console.log (`controller ${client_id} added to KV registry`)
                     
                     // notify all connected synths about the new controller
-                    const notification = {
+                    const notification: Message = {
                         type: "controller-joined",
                         controller_id: client_id,
                         timestamp: Date.now ()
@@ -107,7 +181,7 @@ async function handle_request (request) {
                 console.log (`controller ${client_id} removed from KV registry`)
                 
                 // notify all connected synths about the controller leaving
-                const notification = {
+                const notification: Message = {
                     type: "controller-left",
                     controller_id: client_id,
                     timestamp: Date.now ()
@@ -129,18 +203,13 @@ async function handle_request (request) {
     if (url.pathname === "/ice-servers") {
         const ice_servers = await get_turn_credentials ()
         
-        if (ice_servers) {
-            return new Response (JSON.stringify ({ ice_servers }), {
-                headers: { "content-type": "application/json" }
-            })
-        } else {
-            // fallback to just STUN
-            return new Response (JSON.stringify ({
-                ice_servers: [{ urls: "stun:stun.l.google.com:19302" }]
-            }), {
-                headers: { "content-type": "application/json" }
-            })
-        }
+        const response: IceServersResponse = ice_servers 
+            ? { ice_servers }
+            : { ice_servers: [{ urls: "stun:stun.l.google.com:19302" }] }
+            
+        return new Response (JSON.stringify (response), {
+            headers: { "content-type": "application/json" }
+        })
     }
     
     // serve static files
@@ -171,9 +240,9 @@ async function handle_request (request) {
 }
 
 // handle incoming websocket messages and queue them in kv
-async function handle_websocket_message (sender_id, data) {
+async function handle_websocket_message (sender_id: string, data: string): Promise<void> {
     try {
-        const message = JSON.parse (data)
+        const message: Message = JSON.parse (data)
         message.sender_id = sender_id
         message.timestamp = Date.now ()
         
@@ -182,7 +251,7 @@ async function handle_websocket_message (sender_id, data) {
         // handle heartbeat from controller
         if (message.type === "heartbeat" && sender_id.startsWith ("ctrl-")) {
             const key = ["controllers", sender_id]
-            const value = {
+            const value: KVControllerEntry = {
                 timestamp: Date.now (),
                 ws_id: connections.get (sender_id)?.actual_id || sender_id
             }
@@ -201,7 +270,7 @@ async function handle_websocket_message (sender_id, data) {
                 controllers_list.push (controller_id)
             }
             
-            const response = {
+            const response: Message = {
                 type: "controllers-list",
                 controllers: controllers_list,
                 timestamp: Date.now ()
@@ -225,10 +294,12 @@ async function handle_websocket_message (sender_id, data) {
                     client_info.socket.send (JSON.stringify (message))
                 }
             }
-        } else {
+        } else if (message.target) {
             // queue message in kv with ttl of 30 seconds
             const key = ["messages", message.target, crypto.randomUUID ()]
             await kv.set (key, message, { expireIn: 30 * 1000 })
+        } else {
+            console.error (`message missing target: ${JSON.stringify(message)}`)
         }
         
     } catch (error) {
@@ -237,14 +308,14 @@ async function handle_websocket_message (sender_id, data) {
 }
 
 // poll kv for messages destined to this client
-async function start_polling_for_client (client_id, socket) {
+async function start_polling_for_client (client_id: string, socket: WebSocket): Promise<void> {
     while (socket.readyState === WebSocket.OPEN) {
         try {
             // check for messages targeted specifically to this client
             const entries = kv.list ({ prefix: ["messages", client_id] })
             
             for await (const entry of entries) {
-                const message = entry.value
+                const message = entry.value as Message
                 
                 // send message to client
                 socket.send (JSON.stringify (message))

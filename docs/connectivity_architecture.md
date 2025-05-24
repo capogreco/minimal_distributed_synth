@@ -104,7 +104,36 @@ TTL: 60 seconds
 
 ### Data Channel Messages
 - `touch` - Touch position and state
-- `ping/pong` - Latency measurement
+- `ping/pong` - Latency measurement and state synchronization
+
+## State Synchronization
+
+### Mechanism
+- Controllers send `ping` messages to synths every second
+- Synths respond with `pong` messages that include their complete state
+- No separate state notification messages needed
+- State automatically propagates without explicit requests
+
+### State Structure
+```javascript
+{
+  type: "pong",
+  timestamp: data.timestamp,
+  state: {
+    audio_enabled: !!audio_context,
+    volume: stored_volume,
+    powered_on: is_powered_on
+    // easily extensible with new state fields
+  }
+}
+```
+
+### Benefits of Ping/Pong State Sync
+- **Always Fresh**: State updates automatically every second
+- **Single Mechanism**: No need for separate state messages
+- **Race-Free**: No timing issues or state inconsistencies
+- **Extensible**: Adding new state is as simple as adding fields
+- **Debuggable**: State flow is predictable and observable
 
 ## Benefits
 
