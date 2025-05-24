@@ -117,11 +117,10 @@
                     client_id: synth_id
                 })
                 
-                // announce presence to controllers
+                // request list of active controllers
                 send_message ({
-                    type: "announce",
-                    source: synth_id,
-                    target: "ctrl-*"
+                    type: "request-controllers",
+                    source: synth_id
                 })
             })
             
@@ -148,22 +147,72 @@
         async function handle_message (message) {
             console.log ("received:", message)
             
-            if (message.type === "announce" && message.source.startsWith ("ctrl-")) {
-                // controller announced itself, respond
-                send_message ({
-                    type: "announce",
-                    source: synth_id,
-                    target: message.source
-                })
+            if (message.type === "controllers-list") {
+                // received list of active controllers
+                console.log (`received controllers list: ${message.controllers.join (", ")}`)
+                for (const controller_id of message.controllers) {
+                    if (!controllers.has (controller_id)) {
+                        console.log (`discovered controller: ${controller_id}`)
+                        controllers.set (controller_id, {
+                            id: controller_id,
+                            connection: null,
+                            channel: null,
+                            connected: false
+                        })
+                        // initiate connection to newly discovered controller
+                        connect_to_controller (controller_id)
+                    }
+                }
+                update_controller_list ()
+                
+            } else if (message.type === "controller-joined") {
+                // new controller joined
+                console.log (`new controller joined: ${message.controller_id}`)
+                if (!controllers.has (message.controller_id)) {
+                    console.log (`connecting to new controller: ${message.controller_id}`)
+                    controllers.set (message.controller_id, {
+                        id: message.controller_id,
+                        connection: null,
+                        channel: null,
+                        connected: false
+                    })
+                    // initiate connection to new controller
+                    connect_to_controller (message.controller_id)
+                }
+                update_controller_list ()
+                
+            } else if (message.type === "controller-left") {
+                // controller disconnected
+                console.log (`controller left: ${message.controller_id}`)
+                if (controllers.has (message.controller_id)) {
+                    const controller = controllers.get (message.controller_id)
+                    // close connection if exists
+                    if (controller.connection) {
+                        controller.connection.close ()
+                    }
+                    controllers.delete (message.controller_id)
+                }
                 update_controller_list ()
                 
             } else if (message.type === "offer") {
-                // handle webrtc offer from controller
-                await handle_offer (message)
+                // shouldn't receive offers as synth initiates
+                console.warn ("synth received unexpected offer")
                 
             } else if (message.type === "answer") {
-                // shouldn't receive answers as synth
-                console.warn ("synth received unexpected answer")
+                // handle webrtc answer from controller
+                const controller = controllers.get (message.source)
+                if (controller && controller.connection) {
+                    await controller.connection.setRemoteDescription (message.data)
+                    
+                    // process any queued ice candidates
+                    if (controller.ice_queue && controller.ice_queue.length > 0) {
+                        console.log (`processing ${controller.ice_queue.length} queued ice candidates`)
+                        for (const candidate of controller.ice_queue) {
+                            await controller.connection.addIceCandidate (candidate)
+                        }
+                        controller.ice_queue = []
+                    }
+                }
                 
             } else if (message.type === "ice") {
                 // handle ice candidate
@@ -186,6 +235,88 @@
             }
         }
         
+        // create webrtc connection to controller
+        async function connect_to_controller (controller_id) {
+            console.log (`initiating connection to ${controller_id}`)
+            
+            const pc = new RTCPeerConnection (rtc_config)
+            const controller = controllers.get (controller_id)
+            controller.connection = pc
+            controller.ice_queue = []
+            
+            // create data channels
+            const param_channel = pc.createDataChannel ("params", {
+                ordered: false,
+                maxRetransmits: 0
+            })
+            const command_channel = pc.createDataChannel ("commands", {
+                ordered: true
+            })
+            
+            controller.channel = param_channel
+            controller.command_channel = command_channel
+            
+            // handle ice candidates
+            pc.addEventListener ("icecandidate", (event) => {
+                if (event.candidate) {
+                    console.log (`sending ice candidate: ${event.candidate.candidate}`)
+                    send_message ({
+                        type: "ice",
+                        source: synth_id,
+                        target: controller_id,
+                        data: event.candidate
+                    })
+                } else {
+                    console.log ("ice gathering complete")
+                }
+            })
+            
+            // set up param channel handlers
+            param_channel.addEventListener ("open", () => {
+                console.log (`param channel open to ${controller_id}`)
+                controller.connected = true
+                update_controller_list ()
+            })
+            
+            param_channel.addEventListener ("message", (event) => {
+                handle_data_message (JSON.parse (event.data))
+            })
+            
+            param_channel.addEventListener ("close", () => {
+                console.log (`param channel closed to ${controller_id}`)
+                controller.connected = false
+                update_controller_list ()
+            })
+            
+            // set up command channel handlers
+            command_channel.addEventListener ("message", (event) => {
+                const command = JSON.parse (event.data)
+                if (command.type === "command") {
+                    handle_command (command)
+                }
+            })
+            
+            // handle connection state
+            pc.addEventListener ("connectionstatechange", () => {
+                console.log (`connection state to ${controller_id}: ${pc.connectionState}`)
+                
+                if (pc.connectionState === "failed" || pc.connectionState === "closed") {
+                    controller.connected = false
+                    update_controller_list ()
+                }
+            })
+            
+            // create and send offer
+            const offer = await pc.createOffer ()
+            await pc.setLocalDescription (offer)
+            
+            send_message ({
+                type: "offer",
+                source: synth_id,
+                target: controller_id,
+                data: offer
+            })
+        }
 
         
         // initialize audio
@@ -244,150 +375,40 @@
                 x += bar_width + 1
             }
         }
+
         
-        // handle webrtc offer
-        async function handle_offer (message) {
-            console.log (`handling offer from ${message.source}`)
-            
-            // create peer connection
-            const peer_connection = new RTCPeerConnection (rtc_config)
-            
-            // store controller info
-            const controller = {
-                connection: peer_connection,
-                param_channel: null,
-                command_channel: null,
-                ice_queue: []
-            }
-            controllers.set (message.source, controller)
-            
-            // handle ice candidates
-            peer_connection.addEventListener ("icecandidate", (event) => {
-                if (event.candidate) {
-                    console.log (`sending ice candidate: ${event.candidate.candidate}`)
-                    send_message ({
-                        type: "ice",
-                        source: synth_id,
-                        target: message.source,
-                        data: event.candidate
-                    })
-                } else {
-                    console.log ("ice gathering complete")
-                }
-            })
-            
-            // monitor ice connection state
-            peer_connection.addEventListener ("iceconnectionstatechange", () => {
-                console.log (`ice connection state: ${peer_connection.iceConnectionState}`)
-                update_controller_list ()
-            })
-            
-            // monitor ice gathering state  
-            peer_connection.addEventListener ("icegatheringstatechange", () => {
-                console.log (`ice gathering state: ${peer_connection.iceGatheringState}`)
-            })
-            
-            // clean up on connection failure
-            peer_connection.addEventListener ("connectionstatechange", () => {
-                if (peer_connection.connectionState === "failed" || peer_connection.connectionState === "closed") {
-                    controllers.delete (message.source)
-                    update_controller_list ()
-                }
-            })
-            
-            // handle data channels
-            peer_connection.addEventListener ("datachannel", (event) => {
-                const channel = event.channel
-                
-                if (channel.label === "params") {
-                    controller.param_channel = channel
-                    
-                    channel.addEventListener ("open", () => {
-                        console.log ("param channel open")
-                        status_el.textContent = `Connected as ${synth_id}`
-                        update_controller_list ()
-                    })
-                    
-                    channel.addEventListener ("message", (event) => {
-                        const data = JSON.parse (event.data)
-                        if (data.type === "param") {
-                            update_param (data.name, data.value, message.source)
-                        } else if (data.type === "ping") {
-                            // respond with pong
-                            channel.send (JSON.stringify ({
-                                type: "pong",
-                                timestamp: data.timestamp
-                            }))
-                        }
-                    })
-                    
-                    channel.addEventListener ("close", () => {
-                        console.log ("param channel closed")
-                        update_controller_list ()
-                    })
-                    
-                } else if (channel.label === "commands") {
-                    controller.command_channel = channel
-                    
-                    channel.addEventListener ("open", () => {
-                        console.log ("command channel open")
-                    })
-                    
-                    channel.addEventListener ("message", (event) => {
-                        const data = JSON.parse (event.data)
-                        if (data.type === "command") {
-                            handle_command (data.name, data.value, message.source)
-                        }
-                    })
-                }
-            })
-            
-            // set remote description and create answer
-            await peer_connection.setRemoteDescription (message.data)
-            const answer = await peer_connection.createAnswer ()
-            await peer_connection.setLocalDescription (answer)
-            
-            // process any queued ice candidates
-            if (controller.ice_queue && controller.ice_queue.length > 0) {
-                console.log (`processing ${controller.ice_queue.length} queued ice candidates`)
-                for (const candidate of controller.ice_queue) {
-                    try {
-                        await peer_connection.addIceCandidate (candidate)
-                    } catch (error) {
-                        console.error ("error adding queued ice candidate:", error)
+        // handle data messages from controllers
+        function handle_data_message (data) {
+            if (data.type === "param") {
+                console.log (`param ${data.name} = ${data.value}`)
+                if (data.name === "volume") {
+                    stored_volume = data.value
+                    volume_display.textContent = data.value.toFixed (2)
+                    if (gain_node && is_powered_on) {
+                        gain_node.gain.value = data.value
                     }
                 }
-                controller.ice_queue = []
-            }
-            
-            // send answer back
-            send_message ({
-                type: "answer",
-                source: synth_id,
-                target: message.source,
-                data: answer
-            })
-        }
-        
-        // handle parameter updates
-        function update_param (name, value, source) {
-            console.log (`param ${name} = ${value} from ${source}`)
-            if (name === "volume") {
-                stored_volume = value
-                volume_display.textContent = value.toFixed (2)
-                if (gain_node && is_powered_on) {
-                    gain_node.gain.value = value
+            } else if (data.type === "ping") {
+                // find the controller that sent this ping
+                for (const [ctrl_id, ctrl] of controllers) {
+                    if (ctrl.channel && ctrl.channel.readyState === "open") {
+                        ctrl.channel.send (JSON.stringify ({
+                            type: "pong",
+                            timestamp: data.timestamp
+                        }))
+                        break
+                    }
                 }
             }
         }
         
         // handle command updates
-        function handle_command (name, value, source) {
-            console.log (`command ${name} = ${value} from ${source}`)
-            if (name === "power") {
-                is_powered_on = value
+        function handle_command (command) {
+            console.log (`command ${command.name} = ${command.value}`)
+            if (command.name === "power") {
+                is_powered_on = command.value
                 if (gain_node) {
-                    if (value) {
+                    if (command.value) {
                         // power on - restore stored volume
                         gain_node.gain.value = stored_volume
                     } else {
@@ -398,18 +419,16 @@
             }
         }
         
-        // update controller list ui
+        // update controller list display
         function update_controller_list () {
             const controller_list_el = document.getElementById ("controller_list")
-            const connected_controllers = Array.from (controllers.entries ()).filter (
-                ([id, ctrl]) => ctrl.connection && ctrl.connection.iceConnectionState === "connected"
-            )
+            const all_controllers = Array.from (controllers.entries ())
             
-            if (connected_controllers.length === 0) {
+            if (all_controllers.length === 0) {
                 controller_list_el.textContent = "None"
             } else {
-                controller_list_el.innerHTML = connected_controllers.map (([id, ctrl]) => 
-                    `<div style="margin: 2px 0;">${id}</div>`
+                controller_list_el.innerHTML = all_controllers.map (([id, ctrl]) => 
+                    `<div style="margin: 2px 0;">${id} ${ctrl.connected ? '(connected)' : '(discovered)'}</div>`
                 ).join ("")
             }
         }

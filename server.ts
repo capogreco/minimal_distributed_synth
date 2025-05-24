@@ -64,6 +64,32 @@ async function handle_request (request) {
                 connections.delete (old_id)
                 connections.set (client_id, { socket, actual_id: client_id })
                 console.log (`client registered as: ${client_id}`)
+                
+                // if this is a controller, add to KV registry
+                if (client_id.startsWith ("ctrl-")) {
+                    const key = ["controllers", client_id]
+                    const value = {
+                        timestamp: Date.now (),
+                        ws_id: temp_id
+                    }
+                    await kv.set (key, value, { expireIn: 60 * 1000 }) // 60 second TTL
+                    console.log (`controller ${client_id} added to KV registry`)
+                    
+                    // notify all connected synths about the new controller
+                    const notification = {
+                        type: "controller-joined",
+                        controller_id: client_id,
+                        timestamp: Date.now ()
+                    }
+                    
+                    for (const [conn_id, conn_info] of connections) {
+                        if (conn_id.startsWith ("synth-") && conn_info.socket.readyState === WebSocket.OPEN) {
+                            conn_info.socket.send (JSON.stringify (notification))
+                            console.log (`notified ${conn_id} about new controller ${client_id}`)
+                        }
+                    }
+                }
+                
                 start_polling_for_client (client_id, socket)
                 return
             }
@@ -71,9 +97,29 @@ async function handle_request (request) {
             await handle_websocket_message (client_id, event.data)
         })
         
-        socket.addEventListener ("close", () => {
+        socket.addEventListener ("close", async () => {
             console.log (`client disconnected: ${client_id}`)
             connections.delete (client_id)
+            
+            // if this was a controller, remove from KV registry
+            if (client_id.startsWith ("ctrl-")) {
+                await kv.delete (["controllers", client_id])
+                console.log (`controller ${client_id} removed from KV registry`)
+                
+                // notify all connected synths about the controller leaving
+                const notification = {
+                    type: "controller-left",
+                    controller_id: client_id,
+                    timestamp: Date.now ()
+                }
+                
+                for (const [conn_id, conn_info] of connections) {
+                    if (conn_id.startsWith ("synth-") && conn_info.socket.readyState === WebSocket.OPEN) {
+                        conn_info.socket.send (JSON.stringify (notification))
+                        console.log (`notified ${conn_id} about controller ${client_id} leaving`)
+                    }
+                }
+            }
         })
         
         return response
@@ -133,18 +179,54 @@ async function handle_websocket_message (sender_id, data) {
         
         console.log (`received: ${message.type} from ${message.source} to ${message.target}`)
         
-        // handle broadcast messages (ending with *)
-        if (message.target.endsWith ("*")) {
-            const prefix = message.target.slice (0, -1) // remove the *
+        // handle heartbeat from controller
+        if (message.type === "heartbeat" && sender_id.startsWith ("ctrl-")) {
+            const key = ["controllers", sender_id]
+            const value = {
+                timestamp: Date.now (),
+                ws_id: connections.get (sender_id)?.actual_id || sender_id
+            }
+            await kv.set (key, value, { expireIn: 60 * 1000 }) // refresh 60 second TTL
+            console.log (`heartbeat from ${sender_id}, TTL refreshed`)
+            return
+        }
+        
+        // handle synth requesting controller list
+        if (message.type === "request-controllers") {
+            const controllers_list = []
+            const entries = kv.list ({ prefix: ["controllers"] })
             
-            // send to all matching connected clients
+            for await (const entry of entries) {
+                const controller_id = entry.key[1] as string
+                controllers_list.push (controller_id)
+            }
+            
+            const response = {
+                type: "controllers-list",
+                controllers: controllers_list,
+                timestamp: Date.now ()
+            }
+            
+            const client_connection = connections.get (sender_id)
+            if (client_connection && client_connection.socket.readyState === WebSocket.OPEN) {
+                client_connection.socket.send (JSON.stringify (response))
+                console.log (`sent controllers list to ${sender_id}: ${controllers_list.join (", ")}`)
+            }
+            return
+        }
+        
+        // handle controller-to-controller announcements (for multi-controller warning)
+        if (message.type === "announce" && message.target === "ctrl-*") {
+            // broadcast to all other controllers
             for (const [client_id, client_info] of connections) {
-                if (client_id.startsWith (prefix) && client_info.socket.readyState === WebSocket.OPEN) {
+                if (client_id.startsWith ("ctrl-") && 
+                    client_id !== sender_id && 
+                    client_info.socket.readyState === WebSocket.OPEN) {
                     client_info.socket.send (JSON.stringify (message))
                 }
             }
         } else {
-            // queue specific message in kv with ttl of 30 seconds
+            // queue message in kv with ttl of 30 seconds
             const key = ["messages", message.target, crypto.randomUUID ()]
             await kv.set (key, message, { expireIn: 30 * 1000 })
         }

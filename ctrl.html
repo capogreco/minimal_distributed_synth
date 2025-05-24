@@ -89,6 +89,7 @@
         const peers = new Map ()
         const other_controllers = new Set ()
         let ws = null
+        let heartbeat_interval = null
         
         // webrtc configuration
         let rtc_config = {
@@ -128,17 +129,21 @@
                     client_id: controller_id
                 })
                 
-                // announce presence to synths and other controllers
-                send_message ({
-                    type: "announce",
-                    source: controller_id,
-                    target: "synth-*"
-                })
+                // announce presence to other controllers (for warning system)
                 send_message ({
                     type: "announce", 
                     source: controller_id,
                     target: "ctrl-*"
                 })
+                
+                // start heartbeat interval
+                heartbeat_interval = setInterval (() => {
+                    send_message ({
+                        type: "heartbeat",
+                        source: controller_id
+                    })
+                    console.log ("sent heartbeat")
+                }, 20000) // every 20 seconds
             })
             
             ws.addEventListener ("message", async (event) => {
@@ -149,6 +154,13 @@
             ws.addEventListener ("close", () => {
                 console.log ("disconnected from server")
                 status_el.textContent = "Disconnected - Reconnecting..."
+                
+                // clear heartbeat interval
+                if (heartbeat_interval) {
+                    clearInterval (heartbeat_interval)
+                    heartbeat_interval = null
+                }
+                
                 setTimeout (connect_websocket, 2000)
             })
         }
@@ -164,16 +176,7 @@
         async function handle_message (message) {
             console.log ("received:", message)
             
-            if (message.type === "announce" && message.source.startsWith ("synth-")) {
-                // synth announced itself
-                const existing_peer = peers.get (message.source)
-                update_synth_list (message.source, "discovered")
-                // automatically connect to newly discovered synth
-                if (!existing_peer || !existing_peer.connection) {
-                    await connect_to_synth (message.source)
-                }
-                
-            } else if (message.type === "announce" && message.source.startsWith ("ctrl-") && message.source !== controller_id) {
+            if (message.type === "announce" && message.source.startsWith ("ctrl-") && message.source !== controller_id) {
                 // another controller announced itself
                 const is_new = !other_controllers.has (message.source)
                 other_controllers.add (message.source)
@@ -188,8 +191,8 @@
                 }
                 
             } else if (message.type === "offer") {
-                // shouldn't receive offers as controller
-                console.warn ("controller received unexpected offer")
+                // handle webrtc offer from synth
+                await handle_offer (message)
                 
             } else if (message.type === "answer") {
                 // handle webrtc answer from synth
@@ -227,6 +230,159 @@
             }
         }
         
+        // send current volume to all connected synths
+        function send_volume () {
+            const value = parseFloat (volume_el.value)
+            peers.forEach ((peer, id) => {
+                if (peer.param_channel && peer.param_channel.readyState === "open") {
+                    peer.param_channel.send (JSON.stringify ({
+                        type: "param",
+                        name: "volume",
+                        value: value
+                    }))
+                }
+            })
+        }
+        
+        // send touch data (placeholder for now - no touch handling implemented yet)
+        function send_touch_data () {
+            // TODO: implement touch/mouse position tracking and sending
+            console.log ("send_touch_data called - not implemented yet")
+        }
+        
+        // handle incoming offer from synth
+        async function handle_offer (message) {
+            console.log (`handling offer from ${message.source}`)
+            
+            const pc = new RTCPeerConnection (rtc_config)
+            
+            // store peer info
+            const peer = {
+                connection: pc,
+                param_channel: null,
+                command_channel: null,
+                ice_queue: [],
+                latency: null,
+                ping_interval: null
+            }
+            peers.set (message.source, peer)
+            
+            // handle ice candidates
+            pc.addEventListener ("icecandidate", (event) => {
+                if (event.candidate) {
+                    console.log (`sending ice candidate: ${event.candidate.candidate}`)
+                    send_message ({
+                        type: "ice",
+                        source: controller_id,
+                        target: message.source,
+                        data: event.candidate
+                    })
+                } else {
+                    console.log ("ice gathering complete")
+                }
+            })
+            
+            // handle data channels from synth
+            pc.addEventListener ("datachannel", (event) => {
+                const channel = event.channel
+                console.log (`received data channel: ${channel.label}`)
+                
+                if (channel.label === "params") {
+                    peer.param_channel = channel
+                    
+                    channel.addEventListener ("open", () => {
+                        console.log (`param channel open to ${message.source}`)
+                        update_synth_list (message.source, "connected")
+                        
+                        // start ping interval
+                        peer.ping_interval = setInterval (() => {
+                            if (channel.readyState === "open") {
+                                channel.send (JSON.stringify ({
+                                    type: "ping",
+                                    timestamp: Date.now ()
+                                }))
+                            }
+                        }, 1000)
+                        
+                        // send initial parameters
+                        send_touch_data ()
+                        send_volume ()
+                        
+                        // send power state via command channel when it opens
+                    })
+                    
+                    channel.addEventListener ("message", (event) => {
+                        const data = JSON.parse (event.data)
+                        if (data.type === "pong") {
+                            const rtt = Date.now () - data.timestamp
+                            peer.latency = rtt
+                            update_synth_list (message.source, pc.connectionState)
+                        }
+                    })
+                    
+                    channel.addEventListener ("close", () => {
+                        if (peer.ping_interval) {
+                            clearInterval (peer.ping_interval)
+                            peer.ping_interval = null
+                        }
+                    })
+                    
+                } else if (channel.label === "commands") {
+                    peer.command_channel = channel
+                    
+                    channel.addEventListener ("open", () => {
+                        console.log (`command channel open to ${message.source}`)
+                        // send current power state
+                        const is_on = power_el.checked
+                        channel.send (JSON.stringify ({
+                            type: "command",
+                            name: "power",
+                            value: is_on
+                        }))
+                    })
+                }
+            })
+            
+            // handle connection state
+            pc.addEventListener ("connectionstatechange", () => {
+                console.log (`connection state: ${pc.connectionState}`)
+                update_synth_list (message.source, pc.connectionState)
+                
+                if (pc.connectionState === "failed" || pc.connectionState === "closed") {
+                    // clean up disconnected peer
+                    if (peer.ping_interval) {
+                        clearInterval (peer.ping_interval)
+                    }
+                    peers.delete (message.source)
+                    update_synth_list (message.source, "disconnected")
+                }
+            })
+            
+            // set remote description and create answer
+            await pc.setRemoteDescription (message.data)
+            const answer = await pc.createAnswer ()
+            await pc.setLocalDescription (answer)
+            
+            // process any queued ice candidates
+            if (peer.ice_queue.length > 0) {
+                console.log (`processing ${peer.ice_queue.length} queued ice candidates`)
+                for (const candidate of peer.ice_queue) {
+                    await pc.addIceCandidate (candidate)
+                }
+                peer.ice_queue = []
+            }
+            
+            // send answer back
+            send_message ({
+                type: "answer",
+                source: controller_id,
+                target: message.source,
+                data: answer
+            })
+        }
+        
+        // COMMENTED OUT: Controllers now accept connections instead of initiating them
+        /*
         // create webrtc connection to synth
         window.connect_to_synth = async function (synth_id) {
             console.log (`connecting to ${synth_id}`)
@@ -370,6 +526,7 @@
                 data: offer
             })
         }
+        */
         
         // update synth list ui
         function update_synth_list (synth_id, status) {
