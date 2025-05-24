@@ -105,6 +105,7 @@
         let pink_noise = null
         let gain_node = null
         let analyser = null
+        let wake_lock = null
         const controllers = new Map ()
         let stored_volume = 0.2  // store volume separately from gain
         let is_powered_on = true  // track power state
@@ -398,6 +399,9 @@
             
             // start visualizer
             draw_visualizer ()
+            
+            // request wake lock to prevent device sleep
+            request_wake_lock ()
         }
         
         // visualizer
@@ -488,6 +492,32 @@
                 ).join ("")
             }
         }
+        
+        // wake lock functions
+        async function request_wake_lock () {
+            try {
+                if ('wakeLock' in navigator) {
+                    wake_lock = await navigator.wakeLock.request('screen')
+                    console.log('Wake lock acquired')
+                    
+                    wake_lock.addEventListener('release', () => {
+                        console.log('Wake lock released')
+                    })
+                }
+            } catch (err) {
+                console.log(`Wake lock error: ${err.name}, ${err.message}`)
+            }
+        }
+        
+        async function handle_visibility_change () {
+            if (document.visibilityState === 'visible' && audio_context) {
+                // re-acquire wake lock when page becomes visible
+                await request_wake_lock()
+            }
+        }
+        
+        // visibility change handler
+        document.addEventListener('visibilitychange', handle_visibility_change)
         
         // start audio on user gesture
         start_button.addEventListener ("click", init_audio)

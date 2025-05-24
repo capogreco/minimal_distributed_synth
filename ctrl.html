@@ -94,6 +94,7 @@
         const other_controllers = new Set ()
         let ws = null
         let heartbeat_interval = null
+        let wake_lock = null
         
         // webrtc configuration
         let rtc_config = {
@@ -646,9 +647,37 @@
             }
         }
         
+        // wake lock functions
+        async function request_wake_lock () {
+            try {
+                if ('wakeLock' in navigator) {
+                    wake_lock = await navigator.wakeLock.request('screen')
+                    console.log('Wake lock acquired')
+                    
+                    wake_lock.addEventListener('release', () => {
+                        console.log('Wake lock released')
+                    })
+                }
+            } catch (err) {
+                console.log(`Wake lock error: ${err.name}, ${err.message}`)
+            }
+        }
+        
+        async function handle_visibility_change () {
+            if (document.visibilityState === 'visible') {
+                // re-acquire wake lock when page becomes visible
+                await request_wake_lock()
+            }
+        }
+        
+        // visibility change handler
+        document.addEventListener('visibilitychange', handle_visibility_change)
+        
         // start connection
         fetch_ice_servers ().then (() => {
             connect_websocket ()
+            // request wake lock on startup
+            request_wake_lock ()
         })
     </script>
 </body>
