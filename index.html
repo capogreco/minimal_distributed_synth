@@ -80,7 +80,7 @@
     </style>
 </head>
 <body>
-    <h1>Synth</h1>
+    <canvas id="visualizer" class="dimmed"></canvas>
     
     <div id="status">Disconnected</div>
     
@@ -100,10 +100,7 @@
         <button id="join_instrument">Join Instrument</button>
     </div>
     
-    <canvas id="visualizer" class="dimmed"></canvas>
-    
     <div id="params" class="dimmed">
-        <div class="param">Volume: <span id="volume_display">0.2</span></div>
     </div>
 
     <script>
@@ -143,7 +140,7 @@
         const join_button = document.getElementById ("join_instrument")
         const calibration_phase = document.getElementById ("calibration_phase")
         const join_phase = document.getElementById ("join_phase")
-        const volume_display = document.getElementById ("volume_display")
+
         const canvas = document.getElementById ("visualizer")
         const ctx = canvas.getContext ("2d")
         
@@ -386,6 +383,9 @@
             // load audio worklets
             await audio_context.audioWorklet.addModule ("pink_noise.js")
             await audio_context.audioWorklet.addModule ("cosine_ramp.js")
+            await audio_context.audioWorklet.addModule ("white_noise.js")
+            await audio_context.audioWorklet.addModule ("lfo_worklet.js")
+            await audio_context.audioWorklet.addModule ("exp_converter.js")
             
             // create calibration audio graph
             pink_noise = new AudioWorkletNode (audio_context, "ridge-rat-type2-pink-noise-generator")
@@ -427,7 +427,7 @@
         
         // join the instrument proper
         async function join_instrument () {
-            // trigger the paused ramp to start fading from 0.2 → 0.0
+            // fade out calibration pink noise over 2s
             fadeOut.port.postMessage({
                 type: 'trigger',
                 data: {
@@ -437,14 +437,90 @@
                 }
             })
             
-            // Exit calibration mode after fade completes
-            setTimeout(() => { in_calibration_mode = false }, 2000)
+            // build white noise synthesis chain
+            const white_noise = new AudioWorkletNode(audio_context, "white-noise-generator")
+            const lpf = audio_context.createBiquadFilter()
+            const instrument_gain = audio_context.createGain()
+            const mute_node = audio_context.createGain()
+            
+            // create LFOs
+            const sinusoidal_lfo = new AudioWorkletNode(audio_context, "generic-lfo", {
+                processorOptions: {
+                    mode: "sinusoidal",
+                    period: 2.0,
+                    width: 1.0,     // 0-1 range for exponential converter
+                    offset: 0.0,    // 0-1 range for exponential converter
+                    paused: false   // explicitly ensure LFO is running
+                }
+            })
+            
+            // create exponential converter for musical filter sweeps
+            const filter_exp_converter = new AudioWorkletNode(audio_context, "exponential-converter", {
+                processorOptions: {
+                    minValue: 23.4,   // 23.4Hz minimum (matches FFT bin 1)
+                    maxValue: 9600,   // 9.6kHz maximum (matches visible FFT range)
+                    inputMin: 0.0,    // expect 0-1 from LFO
+                    inputMax: 1.0
+                }
+            })
+            
+            // create exponential converter for natural amplitude curves
+            const amp_exp_converter = new AudioWorkletNode(audio_context, "exponential-converter", {
+                processorOptions: {
+                    minValue: 0.001,  // effectively silent
+                    maxValue: 1.0,    // full amplitude
+                    inputMin: 0.0,    // expect 0-1 from LFO
+                    inputMax: 1.0
+                }
+            })
+            
+
+            
+
+            
+            const ramp_lfo = new AudioWorkletNode(audio_context, "generic-lfo", {
+                processorOptions: {
+                    mode: "ramp", 
+                    period: 2.0,
+                    width: 1.0,     // full gain range
+                    offset: 0.0     // start from zero
+                }
+            })
+            
+            // configure filter
+            lpf.type = "lowpass"
+            lpf.frequency.value = 0  // set to 0 so LFO controls full value (not additive)
+            lpf.Q.value = 8.0  // high resonance to make filter sweep more audible
+            
+            // configure gains
+            instrument_gain.gain.value = 0.0  // set to 0 so ramp LFO controls full value (not additive)
+            mute_node.gain.value = 0.0  // start muted
+            
+            // connect LFO through exponential converter to filter frequency
+            sinusoidal_lfo.connect(filter_exp_converter)
+            filter_exp_converter.connect(lpf.frequency)
+            
+            // connect ramp LFO through exponential converter to amplitude
+            ramp_lfo.connect(amp_exp_converter)
+            amp_exp_converter.connect(instrument_gain.gain)
+            
+            // connect synthesis chain: white noise → LPF → gain → mute → analyser → destination
+            white_noise.connect(lpf)
+            lpf.connect(instrument_gain)
+            instrument_gain.connect(mute_node)
+            mute_node.connect(analyser)
+            
+            // unmute instrument after pink noise fade completes
+            setTimeout(() => { 
+                mute_node.gain.value = 1.0
+                in_calibration_mode = false 
+            }, 2000)
             
             // update UI
             join_phase.style.display = "none"
             document.getElementById ("params").classList.remove ("dimmed")
             
-            console.log ("joined instrument")
+            console.log ("joined instrument - white noise synthesis chain with LFOs active")
             
             // request wake lock to prevent device sleep
             request_wake_lock ()
@@ -484,7 +560,6 @@
                 console.log (`param ${data.name} = ${data.value}`)
                 if (data.name === "volume") {
                     stored_volume = data.value
-                    volume_display.textContent = data.value.toFixed (2)
                     if (gain_node && is_powered_on && !in_calibration_mode) {
                         gain_node.gain.value = data.value
                     }

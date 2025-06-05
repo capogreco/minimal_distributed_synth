@@ -52,19 +52,25 @@ WhiteNoiseWorklet -> LowPassFilter -> GainNode -> MuteNode -> AudioDestination
 **Objective**: Volume calibration works + LFO system operational
 
 **Deliverables:**
-- [ ] **Volume calibration flow**
+- [x] **Volume calibration flow**
   - Instructions UI with "Join Instrument" button
   - Pink noise at 0.2 volume for hardware level setting
-  - Smooth transition to instrument proper
-  - **Test**: User can start calibration, hear pink noise at 0.2, click "Join Instrument"
+  - Smooth transition to instrument proper using cosine ramp
+  - **Test**: User can start calibration, hear pink noise at 0.2, click "Join Instrument" ✅
 
-- [ ] **Generic LFO AudioWorklet** (one worklet, mode parameter)
+- [x] **Generic LFO AudioWorklet** (one worklet, mode parameter)
   - Support for `{mode: "ramp", period: 2.0, width: 1.0, offset: 0.0}`
   - Support for `{mode: "sinusoidal", period: 2.0, width: 1.0, offset: 0.0}`
   - Sinusoidal mode uses inverted cosine (1 phase = sine envelope)
-  - **Test**: Can instantiate both modes, verify output waveforms
+  - **Test**: Can instantiate both modes, verify output waveforms ✅
 
-- [ ] **Master phase ramp** (instance of generic LFO)
+- [x] **Cosine ramp utility** (additional implementation)
+  - Smooth parameter automation with exact zero capability
+  - Message-based control for dynamic ramping
+  - Overcomes Web Audio API limitations
+  - **Test**: Smooth 2-second fade from calibration to instrument ✅
+
+- [ ] **Master phase ramp** (deferred - using direct LFO control instead)
   - Controls global phase for all other LFOs
   - Receives period updates from controller
   - **Test**: Master phase outputs 0-1 sawtooth wave at specified period
@@ -81,24 +87,32 @@ WhiteNoiseWorklet -> LowPassFilter -> GainNode -> MuteNode -> AudioDestination
 
 **Success Criteria**: Calibration→instrument transition works, phase indicator animates correctly
 
+**✅ COMPLETED**: Volume calibration with smooth cosine ramp transition and additional AudioWorklet utilities
+
 ---
 
 ### Phase 2: Basic Synthesis Chain
 **Objective**: Functioning white noise instrument with LFO modulation
 
 **Deliverables:**
-- [ ] **White noise → LPF → gain → mute audio graph**
+- [x] **White noise → LPF → gain → mute audio graph**
   - WhiteNoiseWorklet implementation
-  - BiquadFilterNode (lowpass) for filtering
+  - BiquadFilterNode (lowpass) for filtering with high Q resonance
   - GainNode for amplitude control
   - Final mute/unmute capability
-  - **Test**: Can hear filtered white noise when unmuted during instrument phase
+  - **Test**: Can hear filtered white noise when unmuted during instrument phase ✅
 
-- [ ] **LFO→filter + LFO→gain connections**
-  - Sinusoidal LFO modulates filter cutoff frequency
-  - Ramp LFO modulates gain amplitude
+- [x] **LFO→filter + LFO→gain connections**
+  - Sinusoidal LFO modulates filter cutoff frequency (23.4Hz - 9.6kHz exponential sweep)
+  - Ramp LFO modulates gain amplitude (0.001 - 1.0 exponential curve)
   - Proper audio rate parameter control
-  - **Test**: Filter cutoff oscillates sinusoidally, gain ramps up/down
+  - **Test**: Filter cutoff sweeps exponentially across full FFT range, gain ramps exponentially ✅
+
+- [x] **Exponential converter utility** (additional implementation)
+  - Converts linear LFO output to exponential parameter control
+  - Musical frequency sweeps and natural amplitude curves
+  - Configurable min/max range with automatic ratio calculation
+  - **Test**: Filter sweeps span entire FFT visualizer, amplitude curves sound natural ✅
 
 - [ ] **Phase reset messaging**
   - Controller sends phase-reset commands
@@ -112,6 +126,8 @@ WhiteNoiseWorklet -> LowPassFilter -> GainNode -> MuteNode -> AudioDestination
   - **Test**: Multiple synths show synchronized filter/gain modulation
 
 **Success Criteria**: Multiple synths play synchronized filtered white noise with visible/audible LFO modulation
+
+**✅ COMPLETED**: White noise synthesis with exponential LFO modulation spanning full FFT range
 
 ---
 
@@ -235,10 +251,12 @@ lfoNode.parameters.get('period').value = newPeriod;
 ### File Structure
 
 **New files to create**:
-- `lfo_worklet.js` - Generic LFO AudioWorklet
-- `sin_parser.js` - SIN notation parsing utilities
-- `stochastic_distributor.js` - Harmonic ratio generation system
-- `calibration_ui.js` - Volume calibration interface logic
+- [x] `lfo_worklet.js` - Generic LFO AudioWorklet ✅
+- [x] `cosine_ramp.js` - Smooth parameter automation utility ✅
+- [x] `white_noise.js` - White noise generator AudioWorklet ✅
+- [x] `exp_converter.js` - Linear to exponential range converter ✅
+- [ ] `sin_parser.js` - SIN notation parsing utilities
+- [ ] `stochastic_distributor.js` - Harmonic ratio generation system
 
 ## Testing Strategy
 
@@ -249,6 +267,22 @@ Each phase should be fully tested before proceeding to the next:
 3. **Multi-Client Testing**: Test with 2-3 synth clients + 1 controller
 4. **Edge Cases**: Test SIN parsing edge cases, network disconnections, etc.
 
+## Completed Features
+
+### AudioWorklet Utilities Library
+The project now includes a comprehensive set of AudioWorklet utilities that overcome Web Audio API limitations:
+
+- **`cosine_ramp.js`**: Smooth parameter automation with exact zero capability and message-based control
+- **`lfo_worklet.js`**: Generic LFO with ramp and sinusoidal modes, pause/resume, and phase control  
+- **`white_noise.js`**: Simple white noise generator for synthesis
+- **`exp_converter.js`**: Linear to exponential range converter for musical parameter scaling
+- **`pink_noise.js`**: Ridge-Rat Type 2 pink noise algorithm (existing)
+
+### Controller Improvements
+- **Cleaner URLs**: `/ctrl` route for controller access
+- **Conflict resolution**: "Kick other controllers" functionality for multiple controller conflicts
+- **FFT visualization**: Proper integration with synthesis chain
+
 ## Future Extensions
 
 Beyond Phase 4, the system could be extended with:
@@ -257,6 +291,7 @@ Beyond Phase 4, the system could be extended with:
 - **Evolutionary algorithms** for automatic SIN configuration
 - **Species-specific presets** based on cicada assembly research
 - **Continuous detune system** using simplex noise (as in Cicada Assembly)
+- **Global phase synchronization** system for multi-synth coordination
 
 ---
 
