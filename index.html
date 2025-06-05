@@ -47,7 +47,7 @@
         button:hover {
             background: #555;
         }
-        #start_audio {
+        #start_calibration, #join_instrument {
             display: block;
             margin: 30px auto;
             padding: 15px 30px;
@@ -55,10 +55,10 @@
             font-size: 16px;
             animation: pulse 2s infinite;
         }
-        #start_audio:hover {
+        #start_calibration:hover, #join_instrument:hover {
             background: #d55;
         }
-        #start_audio:disabled {
+        #start_calibration:disabled, #join_instrument:disabled {
             animation: none;
             background: #444;
             opacity: 0.5;
@@ -89,8 +89,16 @@
         <div id="controller_list" style="padding: 10px; background: #2a2a2a; border-radius: 4px;">None</div>
     </div>
     
-    <div id="audio_hint">Click to enable audio engine</div>
-    <button id="start_audio">Start Audio</button>
+    <div id="calibration_phase">
+        <h3>Volume Calibration</h3>
+        <p>First, calibrate your device volume level.</p>
+        <button id="start_calibration">Calibrate Volume</button>
+    </div>
+    
+    <div id="join_phase" style="display: none;">
+        <p>Pink noise playing at reference level. Adjust your device volume to a comfortable level, then:</p>
+        <button id="join_instrument">Join Instrument</button>
+    </div>
     
     <canvas id="visualizer" class="dimmed"></canvas>
     
@@ -109,6 +117,8 @@
         const controllers = new Map ()
         let stored_volume = 0.2  // store volume separately from gain
         let is_powered_on = true  // track power state
+        let in_calibration_mode = false  // prevent controller interference during calibration
+        let fadeOut = null  // cosine ramp for volume control
         
         // webrtc configuration
         let rtc_config = {
@@ -129,7 +139,10 @@
         
         // ui elements
         const status_el = document.getElementById ("status")
-        const start_button = document.getElementById ("start_audio")
+        const calibration_button = document.getElementById ("start_calibration")
+        const join_button = document.getElementById ("join_instrument")
+        const calibration_phase = document.getElementById ("calibration_phase")
+        const join_phase = document.getElementById ("join_phase")
         const volume_display = document.getElementById ("volume_display")
         const canvas = document.getElementById ("visualizer")
         const ctx = canvas.getContext ("2d")
@@ -366,39 +379,72 @@
         }
 
         
-        // initialize audio
-        async function init_audio () {
+        // initialize calibration phase
+        async function init_calibration () {
             audio_context = new (window.AudioContext || window.webkitAudioContext) ()
             
-            // load audio worklet
+            // load audio worklets
             await audio_context.audioWorklet.addModule ("pink_noise.js")
+            await audio_context.audioWorklet.addModule ("cosine_ramp.js")
             
-            // create nodes
+            // create calibration audio graph
             pink_noise = new AudioWorkletNode (audio_context, "ridge-rat-type2-pink-noise-generator")
             gain_node = audio_context.createGain ()
             analyser = audio_context.createAnalyser ()
             
-            // connect nodes
-            pink_noise.connect (gain_node)
-            gain_node.connect (analyser)
+            // connect audio graph: pink_noise → analyser → destination
+            pink_noise.connect (analyser)
             analyser.connect (audio_context.destination)
             
-            // set initial volume based on power state
-            gain_node.gain.value = is_powered_on ? stored_volume : 0
+            // create paused cosine ramp for volume control
+            fadeOut = new AudioWorkletNode(audio_context, "cosine-ramp", {
+                processorOptions: {
+                    startValue: 0.2,
+                    endValue: 0.0,
+                    duration: 2.0,
+                    trigger: false  // start paused at startValue
+                }
+            })
             
-            // set pink noise amplitude
-            pink_noise.parameters.get ("amplitude").value = 0.2
+            // set pink noise base amplitude to 0, let ramp control it
+            pink_noise.parameters.get ("amplitude").value = 0
             
-            start_button.textContent = "Audio Running"
-            start_button.disabled = true
-            document.getElementById ("audio_hint").style.display = "none"
+            // connect ramp to control amplitude (will output constant 0.2 until triggered)
+            fadeOut.connect(pink_noise.parameters.get("amplitude"))
             
-            // remove dimmed state from UI elements
+            in_calibration_mode = true
+            
+            // update UI to join phase
+            calibration_phase.style.display = "none"
+            join_phase.style.display = "block"
+            
+            // remove dimmed state from visualizer
             document.getElementById ("visualizer").classList.remove ("dimmed")
-            document.getElementById ("params").classList.remove ("dimmed")
             
             // start visualizer
             draw_visualizer ()
+        }
+        
+        // join the instrument proper
+        async function join_instrument () {
+            // trigger the paused ramp to start fading from 0.2 → 0.0
+            fadeOut.port.postMessage({
+                type: 'trigger',
+                data: {
+                    startValue: 0.2,
+                    endValue: 0.0,
+                    duration: 2.0
+                }
+            })
+            
+            // Exit calibration mode after fade completes
+            setTimeout(() => { in_calibration_mode = false }, 2000)
+            
+            // update UI
+            join_phase.style.display = "none"
+            document.getElementById ("params").classList.remove ("dimmed")
+            
+            console.log ("joined instrument")
             
             // request wake lock to prevent device sleep
             request_wake_lock ()
@@ -439,7 +485,7 @@
                 if (data.name === "volume") {
                     stored_volume = data.value
                     volume_display.textContent = data.value.toFixed (2)
-                    if (gain_node && is_powered_on) {
+                    if (gain_node && is_powered_on && !in_calibration_mode) {
                         gain_node.gain.value = data.value
                     }
                 }
@@ -519,8 +565,9 @@
         // visibility change handler
         document.addEventListener('visibilitychange', handle_visibility_change)
         
-        // start audio on user gesture
-        start_button.addEventListener ("click", init_audio)
+        // calibration flow event handlers
+        calibration_button.addEventListener ("click", init_calibration)
+        join_button.addEventListener ("click", join_instrument)
         
         // start connection
         fetch_ice_servers ().then (() => {

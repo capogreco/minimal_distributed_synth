@@ -9,6 +9,8 @@ A WebRTC-based distributed audio synthesis template built for Deno Deploy's edge
 - **TURN server integration** via Twilio for reliable connections through NATs
 - **State synchronization** - New synths receive current controller state on connect
 - **Pink noise synthesis** using AudioWorklet with Ridge-Rat Type 2 algorithm
+- **Cosine ramp utility** - Smooth parameter automation with exact zero capability
+- **Volume calibration phase** - Pink noise reference for device volume setting
 - **Latency monitoring** - Real-time RTT measurement and display
 - **Independent controller sessions** - Each controller manages its own set of synths
 - **Edge-ready architecture** - Built for Deno Deploy's distributed infrastructure
@@ -99,6 +101,12 @@ deno task dev
 - AudioWorklet processor
 - Ridge-Rat Type 2 pink noise algorithm
 - Real-time parameter control
+
+**cosine_ramp.js** (150 lines)
+- AudioWorklet utility for smooth parameter automation
+- Cosine interpolation with exact zero capability
+- Message-based control for dynamic ramping
+- Overcomes Web Audio API limitations
 
 ### State Synchronization
 
