@@ -54,9 +54,18 @@ interface SignalingMessage extends BaseMessage {
     data: any;
 }
 
+interface KickOtherControllersMessage extends BaseMessage {
+    type: "kick-other-controllers";
+}
+
+interface KickedMessage extends BaseMessage {
+    type: "kicked";
+    kicked_by: string;
+}
+
 type Message = RegisterMessage | HeartbeatMessage | RequestControllersMessage | 
                ControllersListMessage | ControllerJoinedMessage | ControllerLeftMessage |
-               SignalingMessage | BaseMessage;
+               SignalingMessage | KickOtherControllersMessage | KickedMessage | BaseMessage;
 
 interface SynthState {
     audio_enabled: boolean;
@@ -215,11 +224,12 @@ async function handle_request (request: Request): Promise<Response> {
     // serve static files
     let path = url.pathname
     if (path === "/") path = "/index.html"
+    if (path === "/ctrl") path = "/ctrl.html"
     
     // handle favicon based on referer
     if (path === "/favicon.ico") {
         const referer = request.headers.get ("referer") || ""
-        if (referer.includes ("ctrl.html")) {
+        if (referer.includes ("ctrl.html") || referer.includes ("/ctrl")) {
             path = "/dish.ico"
         }
     }
@@ -294,6 +304,38 @@ async function handle_websocket_message (sender_id: string, data: string): Promi
                     client_info.socket.send (JSON.stringify (message))
                 }
             }
+        
+        // handle kick other controllers
+        } else if (message.type === "kick-other-controllers" && sender_id.startsWith ("ctrl-")) {
+            console.log (`${sender_id} kicking other controllers`)
+            
+            // find and close all other controller connections
+            const kicked_controllers = []
+            for (const [client_id, client_info] of connections) {
+                if (client_id.startsWith ("ctrl-") && 
+                    client_id !== sender_id && 
+                    client_info.socket.readyState === WebSocket.OPEN) {
+                    
+                    // send kick notification before closing
+                    const kick_notification = {
+                        type: "kicked",
+                        kicked_by: sender_id,
+                        timestamp: Date.now ()
+                    }
+                    client_info.socket.send (JSON.stringify (kick_notification))
+                    
+                    // close the connection
+                    client_info.socket.close (1000, "Kicked by another controller")
+                    kicked_controllers.push (client_id)
+                    
+                    // remove from KV registry
+                    await kv.delete (["controllers", client_id])
+                }
+            }
+            
+            console.log (`kicked controllers: ${kicked_controllers.join (", ")}`)
+            return
+            
         } else if (message.target) {
             // queue message in kv with ttl of 30 seconds
             const key = ["messages", message.target, crypto.randomUUID ()]

@@ -68,8 +68,9 @@
     </div>
     
     <div id="controller_warning" style="display: none; padding: 10px; background: #ff9800; color: white; border-radius: 4px; margin-bottom: 10px;">
-        ⚠️ Multiple controllers detected - last change wins!
+        ⚠️ Controller conflict detected - you have multiple controller windows open!
         <div id="other_controllers" style="font-size: 0.9em; margin-top: 5px;"></div>
+        <button id="kick_others" style="margin-top: 10px; padding: 5px 15px; background: #d32f2f; color: white; border: none; border-radius: 3px; cursor: pointer; font-family: monospace;">Kick Other Controllers</button>
     </div>
     
     <div class="control">
@@ -95,6 +96,7 @@
         let ws = null
         let heartbeat_interval = null
         let wake_lock = null
+        let kicked = false
         
         // webrtc configuration
         let rtc_config = {
@@ -158,6 +160,13 @@
             
             ws.addEventListener ("close", () => {
                 console.log ("disconnected from server")
+                
+                // don't reconnect if we were kicked
+                if (kicked) {
+                    console.log ("not reconnecting - we were kicked")
+                    return
+                }
+                
                 status_el.textContent = "Disconnected - Reconnecting..."
                 
                 // clear heartbeat interval
@@ -194,6 +203,29 @@
                         target: message.source
                     })
                 }
+                
+            } else if (message.type === "kicked") {
+                // handle being kicked by another controller
+                console.log (`kicked by ${message.kicked_by}`)
+                kicked = true
+                status_el.textContent = `Session taken over by ${message.kicked_by}`
+                status_el.style.background = "#d32f2f"
+                status_el.style.color = "white"
+                
+                // disable all controls
+                document.getElementById ("volume").disabled = true
+                document.getElementById ("power").disabled = true
+                document.getElementById ("kick_others").disabled = true
+                
+                // show message to user
+                const warning_el = document.getElementById ("controller_warning")
+                warning_el.style.display = "block"
+                warning_el.style.background = "#d32f2f"
+                warning_el.innerHTML = `
+                    <strong>⚠️ Session Taken Over!</strong><br>
+                    Another controller (${message.kicked_by}) has claimed this session.<br>
+                    <small>Refresh the page to start a new session.</small>
+                `
                 
             } else if (message.type === "offer") {
                 // handle webrtc offer from synth
@@ -610,6 +642,20 @@
                     }))
                 }
             })
+        })
+        
+        // kick other controllers button
+        const kick_others_el = document.getElementById ("kick_others")
+        kick_others_el.addEventListener ("click", () => {
+            console.log ("kicking other controllers")
+            send_message ({
+                type: "kick-other-controllers",
+                source: controller_id
+            })
+            
+            // clear the other controllers locally and hide warning
+            other_controllers.clear ()
+            update_controller_warning ()
         })
         
         // power on/off control

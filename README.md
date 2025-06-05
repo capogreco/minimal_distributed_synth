@@ -10,7 +10,7 @@ A WebRTC-based distributed audio synthesis template built for Deno Deploy's edge
 - **State synchronization** - New synths receive current controller state on connect
 - **Pink noise synthesis** using AudioWorklet with Ridge-Rat Type 2 algorithm
 - **Latency monitoring** - Real-time RTT measurement and display
-- **Multi-controller support** - Transparent handling of multiple controllers
+- **Independent controller sessions** - Each controller manages its own set of synths
 - **Edge-ready architecture** - Built for Deno Deploy's distributed infrastructure
 
 ## Browser Requirements
@@ -38,7 +38,7 @@ cp .env.example .env
 deno task dev
 
 # Open in browser
-# Controller: http://localhost:8000/ctrl.html
+# Controller: http://localhost:8000/ctrl
 # Synth: http://localhost:8000/
 ```
 
@@ -46,15 +46,34 @@ deno task dev
 
 ```
 ┌─────────────┐     WebSocket      ┌─────────────┐     WebSocket      ┌─────────────┐
-│ Controller  │ ←────────────────→ │ Deno Server │ ←────────────────→ │   Synth     │
+│ Controller  │ ←────────────────→ │ Deno Server │ ←────────────────→ │   Synth A   │
 │  (ctrl.html)│                    │ (server.ts) │                    │(index.html) │
-└──────┬──────┘                    └─────────────┘                    └──────┬──────┘
-       │                                   │                                   │
-       │              Signaling via Deno KV Queue                            │
-       │                                                                     │
-       └─────────────────── WebRTC Data Channels ───────────────────────────┘
-                          (Direct P2P Connection)
+└──────┬──────┘                    └─────┬───────┘                    └──────┬──────┘
+       │                                 │                                   │
+       │              Signaling via Deno KV Queue                          │
+       │                                 │         ┌─────────────┐           │
+       │                                 └────────→│   Synth B   │           │
+       │                                           │(index.html) │           │
+       │                                           └──────┬──────┘           │
+       │                                                  │                  │
+       └─────────────────── WebRTC Data Channels ────────┴──────────────────┘
+                    (Direct P2P Connections: 1 Controller → N Synths)
 ```
+
+### Architecture Clarification
+
+**This is a 1-Controller → N-Synths system**, not a shared multi-controller system:
+
+- **Each controller instance** manages its own independent set of synthesizers
+- **Synths automatically connect** to any available controllers they discover
+- **Multiple controller instances** can run simultaneously, but they operate independently
+- **No shared control** - Controller A's synths are separate from Controller B's synths
+- **Controller conflicts** only occur when you accidentally open multiple controller windows for the same session
+
+**Example deployment scenarios:**
+- **Performer A** runs 1 controller + 3 synths for their performance
+- **Performer B** runs 1 controller + 5 synths for their performance  
+- Both can run simultaneously on the same server without interference
 
 ### Key Components
 
@@ -68,13 +87,13 @@ deno task dev
 - Controller interface with parameter controls
 - WebRTC connection management
 - Latency monitoring
-- Multi-controller detection
+- Controller conflict detection (warns if multiple controllers are open)
 
 **index.html** (407 lines)
 - Synthesizer client
 - Pink noise generation via AudioWorklet
 - Visual feedback (frequency analyzer)
-- Multi-controller support
+- Automatic connection to available controllers
 
 **pink_noise.js** (65 lines)
 - AudioWorklet processor
@@ -191,7 +210,7 @@ const synth = new AudioWorkletNode (audio_context, "my-synth")
 - **No build process** - Direct file serving, edit and reload
 - **Minimal abstractions** - Easy to understand and modify
 - **Automatic connections** - No manual connection steps required
-- **Last-write-wins** - Simple conflict resolution for multiple controllers
+- **1-to-N architecture** - Each controller independently manages multiple synths
 - **Edge-first** - Built for distributed deployment from the start
 - **Ping/pong state sync** - State synchronization through existing latency mechanism
 
@@ -224,10 +243,10 @@ TWILIO_AUTH_TOKEN=your_auth_token
 - Latency display shows RTT in milliseconds
 - Consider geographical distance between peers
 
-**Multiple controllers:**
-- System allows multiple controllers by design
-- Orange warning shows when multiple controllers are active
-- Last change to any parameter wins
+**Controller conflicts:**
+- Multiple controller instances can accidentally run simultaneously
+- Orange warning appears when this is detected (usually indicates user error)
+- Each controller should manage its own independent set of synths
 
 ## License
 
